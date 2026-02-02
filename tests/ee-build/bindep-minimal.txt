@@ -1,0 +1,13 @@
+# Minimal system requirements for pip-only redundancy testing
+# Only includes C libraries that CANNOT be satisfied by pip
+
+# anisible-pylibssh REQUIRES libssh C library
+# This is the only truly mandatory system dependency
+libssh [platform:rpm]
+libssh-devel [compile platform:rpm]
+
+# Build essentials (gcc already added in prepend_base)
+# These are needed for pip to compile wheels
+
+# NOTE: All python3-* packages are intentionally OMITTED
+# to test if pip-only installation works

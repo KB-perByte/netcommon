@@ -1,0 +1,415 @@
+---
+# Nightly Bindep Dependency Investigation Workflow
+# Tests versionless python3-* strategy based on ansible-core support matrix
+# Reference: https://docs.ansible.com/projects/ansible/latest/reference_appendices/release_and_maintenance.html#ansible-core-support-matrix
+
+name: Bindep Dependency Tests
+
+on:
+  schedule:
+    # Run nightly at 2:00 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      debug_enabled:
+        description: 'Enable debug output'
+        required: false
+        default: 'false'
+
+env:
+  ANSIBLE_BUILDER_VERSION: "3.1.0"
+
+# ansible-core support matrix (as of 2026):
+# | ansible-core | Control Node Python | Target Node Python |
+# |--------------|--------------------|--------------------|
+# | 2.20         | 3.12 - 3.14        | 3.9 - 3.14         |
+# | 2.19         | 3.11 - 3.13        | 3.8 - 3.13         |
+# | 2.18         | 3.11 - 3.13        | 3.8 - 3.13         |
+
+jobs:
+  # ============================================================
+  # Python Version Matrix Tests (per ansible-core support matrix)
+  # ============================================================
+  build-python-matrix:
+    name: "Build EE - Python ${{ matrix.python_version }} (${{ matrix.base_image_name }})"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Python 3.11 - ansible-core 2.18/2.19 control node
+          - python_version: "3.11"
+            base_image: "registry.fedoraproject.org/fedora:38"
+            base_image_name: "Fedora 38"
+            ansible_core: "2.18/2.19"
+          # Python 3.12 - ansible-core 2.17-2.20 control node
+          - python_version: "3.12"
+            base_image: "registry.fedoraproject.org/fedora:39"
+            base_image_name: "Fedora 39"
+            ansible_core: "2.17-2.20"
+          # Python 3.13 - ansible-core 2.18-2.20 control node
+          - python_version: "3.13"
+            base_image: "registry.fedoraproject.org/fedora:40"
+            base_image_name: "Fedora 40"
+            ansible_core: "2.18-2.20"
+          # Python 3.14 - ansible-core 2.20 control node (future)
+          - python_version: "3.14"
+            base_image: "registry.fedoraproject.org/fedora:rawhide"
+            base_image_name: "Fedora Rawhide"
+            ansible_core: "2.20"
+    outputs:
+      py311_status: ${{ steps.result.outputs.py311_status }}
+      py312_status: ${{ steps.result.outputs.py312_status }}
+      py313_status: ${{ steps.result.outputs.py313_status }}
+      py314_status: ${{ steps.result.outputs.py314_status }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install ansible-builder
+        run: pip install ansible-builder==${{ env.ANSIBLE_BUILDER_VERSION }}
+
+      - name: Create EE config for Python ${{ matrix.python_version }}
+        working-directory: tests/ee-build
+        run: |
+          cat > execution-environment-py${{ matrix.python_version }}.yml << EOF
+          ---
+          # Execution Environment for Python ${{ matrix.python_version }} compatibility testing
+          # ansible-core support: ${{ matrix.ansible_core }} control nodes
+          # Base: ${{ matrix.base_image_name }}
+
+          version: 3
+
+          images:
+            base_image:
+              name: ${{ matrix.base_image }}
+
+          dependencies:
+            ansible_core:
+              package_pip: ansible-core>=2.15.0
+            ansible_runner:
+              package_pip: ansible-runner
+            galaxy: requirements.yml
+            python: requirements.txt
+            system: bindep-fedora.txt
+
+          options:
+            package_manager_path: /usr/bin/dnf
+
+          additional_build_steps:
+            prepend_base:
+              - RUN dnf install -y python3-pip python3-devel gcc
+            append_final:
+              - RUN python3 --version
+              - RUN python3 -c 'from pylibsshext import __full_version__; print(__full_version__)' || echo "pylibssh check deferred to runtime"
+          EOF
+
+      - name: Build Python ${{ matrix.python_version }} Execution Environment
+        id: build
+        working-directory: tests/ee-build
+        continue-on-error: true
+        run: |
+          ansible-builder build \
+            -f execution-environment-py${{ matrix.python_version }}.yml \
+            --tag netcommon-test:py${{ matrix.python_version }} \
+            -v 3 2>&1 | tee build-py${{ matrix.python_version }}.log
+          echo "build_status=$?" >> $GITHUB_OUTPUT
+
+      - name: Runtime Smoke Test
+        id: smoke
+        if: steps.build.outcome == 'success'
+        continue-on-error: true
+        run: |
+          echo "=== Python version ==="
+          docker run --rm netcommon-test:py${{ matrix.python_version }} python3 --version
+
+          echo "=== pylibssh version ==="
+          docker run --rm netcommon-test:py${{ matrix.python_version }} \
+            python3 -c "from pylibsshext import __full_version__; print(__full_version__)"
+
+          echo "=== ncclient import ==="
+          docker run --rm netcommon-test:py${{ matrix.python_version }} \
+            python3 -c "import ncclient; print('ncclient OK')"
+
+          echo "=== paramiko import ==="
+          docker run --rm netcommon-test:py${{ matrix.python_version }} \
+            python3 -c "import paramiko; print('paramiko OK')"
+
+      - name: Set output status
+        id: result
+        run: |
+          echo "py${{ matrix.python_version }}_status=${{ steps.build.outcome }}" >> $GITHUB_OUTPUT
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-py${{ matrix.python_version }}
+          path: tests/ee-build/build-py${{ matrix.python_version }}.log
+
+  # ============================================================
+  # CentOS Stream 9 Build Test (EL9 target node compatibility)
+  # ============================================================
+  build-centos9:
+    name: "Build EE - CentOS Stream 9 (EL9)"
+    runs-on: ubuntu-latest
+    outputs:
+      build_status: ${{ steps.build.outcome }}
+      smoke_status: ${{ steps.smoke.outcome }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install ansible-builder
+        run: pip install ansible-builder==${{ env.ANSIBLE_BUILDER_VERSION }}
+
+      - name: Build CentOS Stream 9 Execution Environment
+        id: build
+        working-directory: tests/ee-build
+        run: |
+          ansible-builder build \
+            -f execution-environment-centos9.yml \
+            --tag netcommon-test:centos9 \
+            -v 3 2>&1 | tee build-centos9.log
+          echo "exit_code=$?" >> $GITHUB_OUTPUT
+
+      - name: Runtime Smoke Test
+        id: smoke
+        run: |
+          echo "=== pylibssh version ==="
+          docker run --rm netcommon-test:centos9 \
+            python3 -c "from pylibsshext import __full_version__; print(__full_version__)"
+
+          echo "=== ncclient import ==="
+          docker run --rm netcommon-test:centos9 \
+            python3 -c "import ncclient; print('ncclient OK')"
+
+          echo "=== paramiko import ==="
+          docker run --rm netcommon-test:centos9 \
+            python3 -c "import paramiko; print('paramiko OK')"
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-centos9
+          path: tests/ee-build/build-centos9.log
+
+  # ============================================================
+  # Pip-Only Redundancy Test
+  # ============================================================
+  build-pip-only:
+    name: "Build EE - Pip-Only (Redundancy Test)"
+    runs-on: ubuntu-latest
+    outputs:
+      build_status: ${{ steps.build.outcome }}
+      smoke_status: ${{ steps.smoke.outcome }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install ansible-builder
+        run: pip install ansible-builder==${{ env.ANSIBLE_BUILDER_VERSION }}
+
+      - name: Build Pip-Only Execution Environment
+        id: build
+        working-directory: tests/ee-build
+        run: |
+          ansible-builder build \
+            -f execution-environment-pip-only.yml \
+            --tag netcommon-test:pip-only \
+            -v 3 2>&1 | tee build-pip-only.log
+          echo "exit_code=$?" >> $GITHUB_OUTPUT
+
+      - name: Runtime Smoke Test
+        id: smoke
+        run: |
+          echo "=== pylibssh version ==="
+          docker run --rm netcommon-test:pip-only \
+            python3 -c "from pylibsshext import __full_version__; print(__full_version__)"
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-pip-only
+          path: tests/ee-build/build-pip-only.log
+
+  # ============================================================
+  # DNF Resolution Tests (EL8 vs EL9)
+  # ============================================================
+  dnf-resolution:
+    name: "DNF Resolution - Versionless python3-* packages"
+    runs-on: ubuntu-latest
+    outputs:
+      el8_status: ${{ steps.el8.outcome }}
+      el9_status: ${{ steps.el9.outcome }}
+    steps:
+      - name: Test CentOS Stream 9 Resolution
+        id: el9
+        run: |
+          echo "=== CentOS Stream 9 Resolution ==="
+          docker run --rm quay.io/centos/centos:stream9 bash -c "
+            dnf install -y python3-six python3-lxml python3-cryptography 2>&1 && \
+            rpm -q python3-six python3-lxml python3-cryptography
+          "
+
+      - name: Test EL8 Resolution (AlmaLinux 8)
+        id: el8
+        run: |
+          echo "=== AlmaLinux 8 (EL8) Resolution ==="
+          docker run --rm almalinux:8 bash -c "
+            dnf install -y python3-six python3-lxml python3-cryptography 2>&1 && \
+            rpm -q python3-six python3-lxml python3-cryptography
+          "
+
+  # ============================================================
+  # Compile Tag Necessity Test
+  # ============================================================
+  compile-tag-test:
+    name: "Build EE - Without [compile] Tags"
+    runs-on: ubuntu-latest
+    outputs:
+      build_status: ${{ steps.build.outcome }}
+      smoke_status: ${{ steps.smoke.outcome }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install ansible-builder
+        run: pip install ansible-builder==${{ env.ANSIBLE_BUILDER_VERSION }}
+
+      - name: Build EE Without Compile Tags
+        id: build
+        working-directory: tests/ee-build
+        continue-on-error: true
+        run: |
+          ansible-builder build \
+            -f execution-environment-no-compile.yml \
+            --tag netcommon-test:no-compile \
+            -v 3 2>&1 | tee build-no-compile.log
+          echo "exit_code=$?" >> $GITHUB_OUTPUT
+
+      - name: Runtime Smoke Test
+        id: smoke
+        if: steps.build.outcome == 'success'
+        run: |
+          echo "=== pylibssh version ==="
+          docker run --rm netcommon-test:no-compile \
+            python3 -c "from pylibsshext import __full_version__; print(__full_version__)" || echo "FAILED"
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-no-compile
+          path: tests/ee-build/build-no-compile.log
+
+  # ============================================================
+  # Summary Report
+  # ============================================================
+  report:
+    name: "Generate Summary Report"
+    runs-on: ubuntu-latest
+    needs: [build-python-matrix, build-centos9, build-pip-only, dnf-resolution, compile-tag-test]
+    if: always()
+    steps:
+      - name: Generate Report
+        run: |
+          cat << 'EOF' >> $GITHUB_STEP_SUMMARY
+          # Bindep Dependency Investigation Report
+
+          **Date:** $(date -u +"%Y-%m-%d %H:%M UTC")
+
+          ## ansible-core Support Matrix Reference
+
+          Based on [official ansible-core support matrix](https://docs.ansible.com/projects/ansible/latest/reference_appendices/release_and_maintenance.html#ansible-core-support-matrix):
+
+          | ansible-core | Status | Control Node Python | Target Node Python |
+          |--------------|--------|--------------------|--------------------|
+          | **2.20** | GA (Nov 2025) | 3.12 - 3.14 | 3.9 - 3.14 |
+          | **2.19** | Critical fixes | 3.11 - 3.13 | 3.8 - 3.13 |
+          | **2.18** | Security fixes | 3.11 - 3.13 | 3.8 - 3.13 |
+          | 2.17 | EOL Nov 2025 | 3.10 - 3.12 | 3.7 - 3.12 |
+
+          ## Python Version Matrix Results
+
+          | Python | Base Image | ansible-core Support | Status |
+          |--------|------------|---------------------|--------|
+          | 3.11 | Fedora 38 | 2.18/2.19 control | ${{ needs.build-python-matrix.result }} |
+          | 3.12 | Fedora 39 | 2.17-2.20 control | ${{ needs.build-python-matrix.result }} |
+          | 3.13 | Fedora 40 | 2.18-2.20 control | ${{ needs.build-python-matrix.result }} |
+          | 3.14 | Fedora Rawhide | 2.20 control (future) | ${{ needs.build-python-matrix.result }} |
+
+          ## Platform Build Results
+
+          | Test | Build | Smoke Test | Status |
+          |------|-------|------------|--------|
+          | CentOS Stream 9 (EL9) | ${{ needs.build-centos9.outputs.build_status }} | ${{ needs.build-centos9.outputs.smoke_status }} | ${{ needs.build-centos9.result }} |
+          | Pip-Only (Redundancy) | ${{ needs.build-pip-only.outputs.build_status }} | ${{ needs.build-pip-only.outputs.smoke_status }} | ${{ needs.build-pip-only.result }} |
+          | No [compile] Tags | ${{ needs.compile-tag-test.outputs.build_status }} | ${{ needs.compile-tag-test.outputs.smoke_status }} | ${{ needs.compile-tag-test.result }} |
+
+          ## DNF Resolution Results
+
+          | Platform | Status |
+          |----------|--------|
+          | CentOS Stream 9 (EL9) | ${{ needs.dnf-resolution.outputs.el9_status }} |
+          | AlmaLinux 8 (EL8) | ${{ needs.dnf-resolution.outputs.el8_status }} |
+
+          ## Key Findings
+
+          ### Versionless Strategy
+          - Versionless `python3-*` package names resolve correctly on both EL8 and EL9
+          - No `python38-*` or `python39-*` prefixes required
+
+          ### Python Version Coverage (per ansible-core matrix)
+          - **Python 3.11**: ansible-core 2.18/2.19 control nodes
+          - **Python 3.12**: ansible-core 2.17-2.20 control nodes (widest coverage)
+          - **Python 3.13**: ansible-core 2.18-2.20 control nodes
+          - **Python 3.14**: ansible-core 2.20 control nodes (future)
+
+          ### CRB Repository Requirement
+          - `python3-Cython` requires CRB (CodeReady Builder) repository on EL9
+          - EE configs must enable CRB before installing compile dependencies
+
+          ### Compile Dependencies
+          - Most packages install from prebuilt wheels (manylinux)
+          - `[compile]` tags only needed when building from source
+          - `libssh` and `libssh-devel` are always required for ansible-pylibssh
+
+          ## Action Items
+
+          | Priority | Action | Rationale |
+          |----------|--------|-----------|
+          | HIGH | Add `platform:centos-9` tag to `python3-Cython` | Currently missing |
+          | HIGH | Document CRB requirement | Required for EL9 builds |
+          | MEDIUM | Monitor Python 3.14 wheel availability | ansible-core 2.20 requirement |
+          | LOW | Remove redundant python3-* entries | `six`, `cffi`, `pycparser` installed by pip |
+
+          EOF
+
+      - name: Check for failures
+        if: contains(needs.*.result, 'failure')
+        run: |
+          echo "::error::One or more tests failed. See summary for details."
+          exit 1

@@ -1,0 +1,23 @@
+# System requirements for Fedora / Python 3.12 testing
+# Fedora uses different package naming in some cases
+
+# Build tools
+gcc-c++ [doc test platform:rpm]
+libyaml-devel [test platform:rpm]
+
+# ansible-pylibssh (compile)
+gcc [compile platform:rpm]
+libssh-devel [compile platform:rpm]
+python3-Cython [compile platform:rpm]
+
+# ansible-pylibssh (runtime)
+libssh [platform:rpm]
+
+# ncclient - Fedora has these as python3-* directly
+python3-six [platform:rpm]
+python3-lxml [platform:rpm]
+
+# paramiko/cryptography
+python3-cffi [platform:rpm]
+python3-cryptography [platform:rpm]
+python3-pycparser [platform:rpm]

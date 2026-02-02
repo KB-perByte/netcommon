@@ -1,0 +1,9 @@
+# Python requirements for EE testing
+# Mirrors the main collection requirements.txt
+ansible-pylibssh >= 0.2.0
+jxmlease
+ncclient
+paramiko
+xmltodict
+grpcio
+protobuf

@@ -1,0 +1,28 @@
+---
+# Execution Environment for CentOS Stream 8 / AlmaLinux 8 testing
+# Tests versionless python3-* bindep resolution on EL8
+
+version: 3
+
+images:
+  base_image:
+    # Note: CentOS Stream 8 is EOL, use AlmaLinux 8 for active testing
+    name: quay.io/centos/centos:stream8
+
+dependencies:
+  ansible_core:
+    package_pip: ansible-core>=2.15.0
+  ansible_runner:
+    package_pip: ansible-runner
+  galaxy: requirements.yml
+  python: requirements.txt
+  system: bindep.txt
+
+options:
+  package_manager_path: /usr/bin/dnf
+
+additional_build_steps:
+  prepend_base:
+    - RUN dnf install -y python3-pip python3-devel
+  append_final:
+    - RUN python3 -c 'from pylibsshext import __full_version__; print(__full_version__)' || echo "pylibssh check will run at runtime"
