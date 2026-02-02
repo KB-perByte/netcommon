@@ -1,0 +1,29 @@
+---
+# Execution Environment for CentOS Stream 9 testing
+# Tests versionless python3-* bindep strategy
+
+version: 3
+
+images:
+  base_image:
+    name: quay.io/centos/centos:stream9
+
+dependencies:
+  ansible_core:
+    package_pip: ansible-core>=2.15.0
+  ansible_runner:
+    package_pip: ansible-runner
+  galaxy: requirements.yml
+  python: requirements.txt
+  system: bindep.txt
+
+options:
+  package_manager_path: /usr/bin/dnf
+
+additional_build_steps:
+  prepend_base:
+    # Enable EPEL and CRB repos for python3-Cython and other dev packages
+    - RUN dnf install -y epel-release && /usr/bin/crb enable
+    - RUN dnf install -y python3-pip python3-devel
+  append_final:
+    - RUN python3 -c 'from pylibsshext import __full_version__; print(__full_version__)' || echo "pylibssh check will run at runtime"

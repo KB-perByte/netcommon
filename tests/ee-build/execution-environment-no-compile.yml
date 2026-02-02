@@ -1,0 +1,30 @@
+---
+# Execution Environment WITHOUT [compile] tagged packages
+# Tests Task 5: Build-Time Side Effect Analysis
+# Expected result: Build FAILURE for ansible-pylibssh
+
+version: 3
+
+images:
+  base_image:
+    name: quay.io/centos/centos:stream9
+
+dependencies:
+  ansible_core:
+    package_pip: ansible-core>=2.15.0
+  ansible_runner:
+    package_pip: ansible-runner
+  galaxy: requirements.yml
+  python: requirements.txt
+  system: bindep-no-compile.txt
+
+options:
+  package_manager_path: /usr/bin/dnf
+
+additional_build_steps:
+  prepend_base:
+    # Enable EPEL and CRB repos
+    - RUN dnf install -y epel-release && /usr/bin/crb enable
+    - RUN dnf install -y python3-pip python3-devel
+  append_final:
+    - RUN python3 -c 'from pylibsshext import __full_version__; print(__full_version__)' && echo PYLIBSSH_OK || echo PYLIBSSH_FAILED
